@@ -8,6 +8,9 @@ from src.data.data_utils import (
     create_train_val_test_splits,
     create_data_loaders,
 )
+from src.models.base_model import SimpleSequentialRecommender
+from src.models.evaluation import evaluate_model
+from src.utils.trainer import Trainer
 
 
 def set_seed(seed):
@@ -44,9 +47,28 @@ def parse_args():
         help="maximum sequence length after padding/truncation",
     )
 
+    # model arguments
+    parser.add_argument(
+        "--embedding_dim", type=int, default=64, help="dimension of item embeddings"
+    )
+    parser.add_argument("--dropout_rate", type=float, default=0.1, help="dropout rate")
+
     # training arguments
     parser.add_argument(
         "--batch_size", type=int, default=32, help="batch size for training"
+    )
+    parser.add_argument("--lr", type=float, default=0.001, help="learning rate")
+    parser.add_argument(
+        "--num_epochs", type=int, default=20, help="number of epochs to train"
+    )
+    parser.add_argument(
+        "--patience", type=int, default=5, help="patience for early stopping"
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="directory to save checkpoints",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="random seed for reproducibility"
@@ -84,8 +106,40 @@ def main():
     print(f"  number of validation sequences: {len(splits['val_sequences'])}")
     print(f"  number of test sequences: {len(splits['test_sequences'])}")
 
-    # This is just the foundation - model implementation will come in future commits
-    print("data utilities setup complete!")
+    # create model
+    model = SimpleSequentialRecommender(
+        num_items=data["num_items"],
+        embedding_dim=args.embedding_dim,
+        dropout_rate=args.dropout_rate,
+    )
+
+    # create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    # create trainer
+    trainer = Trainer(
+        model=model,
+        train_dataloader=dataloaders["train"],
+        val_dataloader=dataloaders["val"],
+        optimizer=optimizer,
+        device=device,
+        checkpoint_dir=args.checkpoint_dir,
+    )
+
+    # train model
+    print("training model...")
+    model, training_results = trainer.train(
+        num_epochs=args.num_epochs, patience=args.patience
+    )
+
+    # evaluate on test set
+    print("evaluating on test set...")
+    test_results = evaluate_model(model, dataloaders["test"])
+
+    # print results
+    print("test results:")
+    for metric_name, metric_value in test_results.items():
+        print(f"  {metric_name}: {metric_value:.4f}")
 
 
 if __name__ == "__main__":
