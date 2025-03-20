@@ -38,9 +38,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main(args=None):
     # Parse arguments
-    args = parse_args()
+    if args is None:
+        args = parse_args()
 
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
@@ -123,6 +124,8 @@ def main():
     )
 
     print(f"analysis complete! figures saved to {args.output_dir}/")
+
+    return stats
 
 
 if __name__ == "__main__":
