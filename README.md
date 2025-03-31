@@ -1,10 +1,93 @@
-# Movie Recommendation System
+# Movie Recommendation System with Model Extraction Defense
 
-This repository contains an implementation of a model-based movie recommendation system trained on the MovieLens-1M dataset. The system uses a neural network to predict which movies a user might enjoy based on their viewing history.
+This repository contains an implementation of a sequential movie recommendation system trained on the MovieLens-1M dataset, along with defense mechanisms against model extraction attacks.
 
 ## Overview
 
-The recommendation system employs a sequential neural network model that takes a sequence of previously watched movies as input and predicts the next movie the user might want to watch. The model is based on embedding representations of movies.
+The recommendation system predicts which movies a user might enjoy based on their viewing history. We've also implemented and evaluated defenses against model extraction attacks, where attackers try to steal the functionality of recommendation models through API queries.
+
+## Key Components
+
+- **Recommendation Model**: A neural network that predicts the next movie a user might want to watch
+- **Model Extraction Attack**: Implementation of methods to steal model behavior through black-box queries
+- **GRO Defense**: Gradient-based Ranking Optimization defense that prevents successful model extraction
+
+## Defense Implementation
+
+The Gradient-based Ranking Optimization (GRO) defense works by:
+
+1. Using a student model to simulate potential attackers
+2. Converting ranking lists to differentiable swap matrices
+3. Computing gradients to maximize the attacker's (student) model loss
+4. Training the target model to both perform well and resist extraction attempts
+
+Core defense code:
+
+```python
+# Core of the gradient-based ranking defense
+def compute_swap_loss(target_logits, student_logits, margin_swap=0.3):
+    swap_matrix_target = create_swap_matrix(target_logits)
+    swap_matrix_student = create_swap_matrix(student_logits)
+
+    swap_loss = torch.mean(torch.relu(margin_swap -
+                         torch.abs(swap_matrix_target - swap_matrix_student)))
+
+    return swap_loss
+
+loss = rec_loss + lambda_swap * swap_loss
+```
+
+## Defense Results
+
+- **Utility Preservation**: 96.91% (defended model maintains most utility)
+- **Attack Success Reduction**: Original attack success 98.8% → Defended 55.7%
+- **Defense Effectiveness**: 43.57% reduction in attack success
+- **Recommendation Overlap**: Original attack overlap@10: 0.90 → Defended: 0.25
+
+## Usage
+
+### Training with Defense
+
+```bash
+python src/defense/apply_defense.py --target-model checkpoints/best_model.pt --lambda-swap 5.0
+```
+
+### Model Extraction Attack
+
+```bash
+python src/attack/model_extraction.py --target-model checkpoints/best_model.pt --queries 500
+```
+
+### Comparing Recommendations
+
+```bash
+python show_recommendations.py
+```
+
+## Requirements
+
+```bash
+pip install torch numpy pandas matplotlib seaborn tqdm
+```
+
+## Project Structure
+
+```
+.
+├── data/                       # Dataset storage
+├── src/
+│   ├── models/                 # Recommendation models
+│   ├── attack/                 # Model extraction attack
+│   │   └── model_extraction.py # Attack implementation
+│   └── defense/                # Defense mechanisms
+│       └── gro_defense.py      # GRO defense implementation
+├── checkpoints/                # Model checkpoints
+├── defense_results/            # Defense evaluation results
+├── attack_results/             # Attack evaluation results
+└── figures/                    # Performance visualizations
+```
+
+For more detailed information about the basic recommendation system, see the original documentation below.
 
 ## Model Architecture
 
@@ -15,14 +98,6 @@ The core of the system is a `SimpleSequentialRecommender` model with the followi
 - Fully connected output layer
 
 The model works by first converting each movie ID into a dense vector representation (embedding), then averaging these embeddings to create a representation of the user's taste, and finally using a fully connected layer to transform this representation into prediction scores for all possible movies.
-
-## Requirements
-
-Before running the system, make sure you have the required dependencies installed:
-
-```bash
-pip install torch numpy pandas matplotlib seaborn tqdm tabulate requests
-```
 
 ## Usage
 
