@@ -38,6 +38,7 @@ class ModelExtractionAttack:
             query_budget: Maximum number of queries to the target model
             top_k: Number of items in the recommendation list
             margin: Margin for the ranking loss
+            surrogate_model: Optional pre-initialized surrogate model
         """
         self.num_items = num_items
         self.embedding_dim = embedding_dim
@@ -50,10 +51,14 @@ class ModelExtractionAttack:
         self.top_k = top_k
         self.margin = margin
 
-        # Load target model
-        self.target_model = self._load_target_model(
-            target_model_path, num_items, embedding_dim
-        )
+        # Target model will be set either by loading from path or directly
+        self.target_model = None
+
+        # If target_model_path is not "dummy_path", try to load target model from path
+        if target_model_path != "dummy_path":
+            self.target_model = self._load_target_model(
+                target_model_path, num_items, embedding_dim
+            )
 
         # Initialize surrogate model
         if surrogate_model is None:
