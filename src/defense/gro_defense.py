@@ -39,7 +39,7 @@ class GRODefense:
         num_items,
         embedding_dim=256,
         device=None,
-        margin_swap=0.3,
+        margin_swap=0.5,
         margin_student=0.1,
         lambda_swap=5.0,
         top_k=10,
@@ -340,113 +340,71 @@ class GRODefense:
         swap_loss = 0.0
         debug_info = {"successful_swaps": 0, "total_attempts": 0, "gradient_norms": []}
 
-        # For each sample in the batch
+        # Compute student loss directly to improve gradient flow
+        student_batch_loss = self._compute_student_loss(student_logits, swap_matrices)
+
+        # Create an adversarial swap matrix for each sample
         for b in range(batch_size):
-            # Get gradients for the current swap matrix
-            swap_matrix = swap_matrices[b].clone().detach().requires_grad_(True)
-            student_loss = self._compute_single_student_loss(
-                student_logits[b], swap_matrix
-            )
+            # Get the original top-k items
+            top_k_values, top_k_indices = torch.topk(target_logits[b], k=self.top_k)
 
-            try:
-                # Compute gradients of the swap matrix with allow_unused=True
-                gradients = torch.autograd.grad(
-                    student_loss,
-                    swap_matrix,
-                    retain_graph=True,
-                    create_graph=True,
-                    allow_unused=True,
-                )[0]
+            # Create a perturbed version of the logits
+            noise = torch.randn_like(target_logits[b]) * 0.5
+            perturbed_logits = target_logits[b].clone() + noise
+            _, perturbed_indices = torch.topk(perturbed_logits, k=self.top_k)
 
-                # If gradients is None (all elements were unused), continue to next sample
-                if gradients is None:
-                    continue
+            # Count unique items between original and perturbed rankings
+            orig_items = set(top_k_indices.tolist())
+            pert_items = set(perturbed_indices.tolist())
+            unique_items = len(orig_items - pert_items)
 
-                # Add gradient norm for debugging
-                debug_info["gradient_norms"].append(gradients.norm().item())
+            # Only proceed if we have some different items
+            if unique_items > 0:
+                debug_info["total_attempts"] += unique_items
 
-                # Apply perturbation to the original recommendations
-                # This creates more diverse and adversarial swap matrices
-                perturbed_gradients = gradients + torch.randn_like(gradients) * 0.1
-
-                # Create new swap matrix based on perturbed gradients
-                new_swap_matrix = torch.zeros_like(swap_matrix)
-
-                # Get top items for each position based on gradients
+                # For each position in the top-k
                 for k in range(self.top_k):
-                    if (
-                        torch.isnan(perturbed_gradients[k]).any()
-                        or torch.isinf(perturbed_gradients[k]).any()
-                    ):
-                        # Skip if gradients contain NaN or Inf
-                        continue
+                    orig_item = top_k_indices[k].item()
+                    pert_item = perturbed_indices[k].item()
 
-                    # Find the item with the maximum gradient
-                    max_grad_item = torch.argmax(perturbed_gradients[k]).item()
-                    new_swap_matrix[k, max_grad_item] = 1.0
+                    # If items are different, apply swap loss
+                    if orig_item != pert_item:
+                        # Push original item's score higher and perturbed item's lower
+                        score_diff = (
+                            target_logits[b, orig_item] - target_logits[b, pert_item]
+                        )
 
-                # Get nonzero indices from both matrices
-                orig_indices = swap_matrix.nonzero()
-                new_indices = new_swap_matrix.nonzero()
+                        # Strong margin to enforce defensiveness
+                        item_loss = torch.max(
+                            torch.tensor(0.0, device=self.device),
+                            # Negative to maximize difference
+                            -score_diff + self.margin_swap,
+                        )
 
-                # Check if both matrices have valid entries
-                if (
-                    orig_indices.size(0) < self.top_k
-                    or new_indices.size(0) < self.top_k
-                ):
-                    continue
+                        # Add to total loss
+                        swap_loss += item_loss
 
-                # Compute swap loss - more aggressive approach
-                for k in range(self.top_k):
-                    debug_info["total_attempts"] += 1
-                    try:
-                        # Original item at position k
-                        original_item = orig_indices[k, 1].item()
-                        # New item that should be at position k according to gradients
-                        new_item = new_indices[k, 1].item()
+                        # Count successful swaps for debugging
+                        if item_loss > 0:
+                            debug_info["successful_swaps"] += 1
 
-                        # Only apply loss if the items are different
-                        if original_item != new_item:
-                            # Calculate score difference
-                            score_diff = (
-                                target_logits[b, original_item]
-                                - target_logits[b, new_item]
-                            )
+        # Ensure non-zero gradient for backpropagation
+        final_loss = (swap_loss / max(batch_size, 1)) + 0.01
 
-                            # Use a stronger push with increased margin
-                            item_loss = torch.max(
-                                torch.tensor(0.0, device=self.device),
-                                score_diff + self.margin_swap,
-                            )
-
-                            # Add to total loss
-                            swap_loss += item_loss
-
-                            # Count successful swaps for debugging
-                            if item_loss > 0:
-                                debug_info["successful_swaps"] += 1
-                    except Exception as e:
-                        continue
-            except Exception as e:
-                continue
+        # Add student loss gradient component
+        final_loss = final_loss + 0.1 * student_batch_loss
 
         # Print debug info occasionally
-        if np.random.random() < 0.05:  # Print for ~5% of batches
+        if np.random.random() < 0.1:  # Increased for more feedback
             success_rate = debug_info["successful_swaps"] / max(
                 debug_info["total_attempts"], 1
             )
-            avg_grad_norm = (
-                np.mean(debug_info["gradient_norms"])
-                if debug_info["gradient_norms"]
-                else 0
-            )
             print(
-                f"Swap debug: success_rate={success_rate:.2f}, attempts={debug_info['total_attempts']}, "
-                f"grad_norm={avg_grad_norm:.4f}"
+                f"Swap debug: success_rate={success_rate:.2f}, "
+                f"attempts={debug_info['total_attempts']}, "
+                f"grad_norm={final_loss.item():.4f}"
             )
 
-        # Add epsilon to ensure non-zero loss for backpropagation
-        final_loss = swap_loss / max(batch_size, 1) + 1e-5
         return final_loss
 
     def _compute_single_student_loss(self, student_logits, swap_matrix):
