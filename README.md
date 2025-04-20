@@ -11,8 +11,11 @@ The recommendation system predicts which movies a user might enjoy based on thei
 - **Recommendation Model**: A neural network that predicts the next movie a user might want to watch
 - **Model Extraction Attack**: Implementation of methods to steal model behavior through black-box queries
 - **GRO Defense**: Gradient-based Ranking Optimization defense that prevents successful model extraction
+- **SEAT Defense**: Similarity Encoder by Adversarial Training for detecting extraction attack attempts
 
 ## Defense Implementation
+
+### GRO Prevention Defense
 
 The Gradient-based Ranking Optimization (GRO) defense works by:
 
@@ -37,19 +40,48 @@ def compute_swap_loss(target_logits, student_logits, margin_swap=0.3):
 loss = rec_loss + lambda_swap * swap_loss
 ```
 
+### SEAT Detection Defense
+
+The SEAT detection defense works by:
+
+1. Training a similarity encoder to recognize suspicious query patterns
+2. Monitoring user accounts for suspiciously similar query pairs
+3. Flagging accounts that exceed a threshold of similar pairs
+4. Tracking the number of accounts needed for a successful attack
+
+The defense is non-invasive (doesn't modify recommendations) and has no negative impact on legitimate users.
+
 ## Defense Results
+
+### GRO Prevention Results
 
 - **Utility Preservation**: 96.91% (defended model maintains most utility)
 - **Attack Success Reduction**: Original attack success 98.8% → Defended 55.7%
 - **Defense Effectiveness**: 43.57% reduction in attack success
 - **Recommendation Overlap**: Original attack overlap@10: 0.90 → Defended: 0.25
 
+### SEAT Detection Results
+
+- **Attack Detection Rate**: 100% (for single-account attacks)
+- **False Positive Rate**: 0.0000% (no benign queries flagged as malicious)
+- **Accounts Needed**: 10 (minimum number of accounts an attacker would need to distribute queries to evade detection)
+
 ## Usage
 
-### Training with Defense
+### Training with GRO Defense
 
 ```bash
 python src/defense/apply_defense.py --target-model checkpoints/best_model.pt --lambda-swap 5.0
+```
+
+### Running SEAT Detection
+
+```bash
+python scripts/run_seat_defense.py \
+  --model_path checkpoints/best_model.pt \
+  --encoder_path defense_results/seat_encoder.pt \
+  --attack_data defense_data/seat_attack_data.pt \
+  --benign_data defense_data/seat_test_data.pt
 ```
 
 ### Model Extraction Attack
@@ -67,7 +99,7 @@ python show_recommendations.py
 ## Requirements
 
 ```bash
-pip install torch numpy pandas matplotlib seaborn tqdm
+pip install torch numpy pandas matplotlib seaborn tqdm networkx
 ```
 
 ## Project Structure
@@ -80,6 +112,7 @@ pip install torch numpy pandas matplotlib seaborn tqdm
 │   ├── attack/                 # Model extraction attack
 │   │   └── model_extraction.py # Attack implementation
 │   └── defense/                # Defense mechanisms
+│       ├── SEAT/               # SEAT detection mechanism
 │       └── gro_defense.py      # GRO defense implementation
 ├── checkpoints/                # Model checkpoints
 ├── defense_results/            # Defense evaluation results
