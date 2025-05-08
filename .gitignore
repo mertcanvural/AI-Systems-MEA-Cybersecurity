@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data files
+data/
+*.csv
+*.dat
+*.pkl
+*.zip
+
+# Model checkpoints and results
+checkpoints/
+*.pt
+attack_results/
+defense_results/
+defense_data/
+SEAT/
+
+# Figures and visualizations
+figures/
+
+# macOS system files
+.DS_Store
+
+# PDF files
+*.pdf
+papers/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Logs
+logs/
+*.log 
