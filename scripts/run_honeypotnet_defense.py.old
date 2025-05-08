@@ -1,0 +1,721 @@
+#!/usr/bin/env python
+"""
+Run HoneypotNet defense against model extraction attacks.
+
+This script applies the HoneypotNet defense to protect a recommendation model
+by injecting a backdoor that transfers to any extracted model, allowing for
+both ownership verification and functionality disruption of stolen models.
+"""
+
+# Standard library imports
+import os
+import sys
+import argparse
+import random
+
+# Third-party imports
+import torch
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Project imports
+from src.models.base_model import SimpleSequentialRecommender
+from src.data.data_utils import load_movielens, create_train_val_test_splitss
+from src.attack.model_extraction import ModelExtractionAttack
+from src.defense.honeypotnet_defense import HoneypotNetDefense
+
+
+def set_seed(seed):
+    """Set random seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+
+
+def load_cc3m_dataset(cc3m_path, num_items, num_samples=5000):
+    """
+    Load a subset of the CC3M dataset as shadow set for HoneypotNet.
+    For simplicity, we simulate loading CC3M by generating random sequences.
+
+    Args:
+        cc3m_path: Path to CC3M dataset (not used in this version)
+        num_items: Number of items in the dataset
+        num_samples: Number of samples to generate
+
+    Returns:
+        shadow_set: List of sequences
+    """
+    # In a real implementation, this would load actual CC3M data
+    # For this implementation, we generate random sequences
+    shadow_set = []
+    for _ in range(num_samples):
+        seq_length = np.random.randint(3, 15)
+        # Generate random sequence (0 is padding, so we use 1 to num_items)
+        sequence = np.random.randint(1, num_items, size=seq_length).tolist()
+        shadow_set.append(sequence)
+
+    return shadow_set
+
+
+def evaluate_defense(target_model, defended_model, test_sequences):
+    """
+    Evaluate the utility preservation of the defended model.
+
+    Args:
+        target_model: Original target model
+        defended_model: Model with HoneypotNet defense
+        test_sequences: Test sequences for evaluation
+
+    Returns:
+        metrics: Dictionary of evaluation metrics
+    """
+    device = next(target_model.parameters()).device
+
+    # Metrics to evaluate
+    ranking_differences = []
+    overlap_at_k = {1: [], 5: [], 10: []}
+
+    target_model.eval()
+    defended_model.eval()
+
+    with torch.no_grad():
+        for sequence in tqdm(test_sequences, desc="Evaluating utility"):
+            if not isinstance(sequence, torch.Tensor):
+                sequence_tensor = torch.tensor([sequence], dtype=torch.long).to(device)
+            else:
+                sequence_tensor = sequence.unsqueeze(0).to(device)
+
+            # Get predictions from target model
+            target_logits = target_model(sequence_tensor)
+            target_scores, target_indices = torch.topk(target_logits[0], k=10)
+
+            # Get predictions from defended model
+            defended_logits = defended_model(sequence_tensor)
+            defended_scores, defended_indices = torch.topk(defended_logits[0], k=10)
+
+            # Convert to lists
+            target_items = target_indices.tolist()
+            defended_items = defended_indices.tolist()
+
+            # Calculate overlap at different k values
+            for k in overlap_at_k.keys():
+                target_at_k = set(target_items[:k])
+                defended_at_k = set(defended_items[:k])
+                overlap = len(target_at_k.intersection(defended_at_k)) / k
+                overlap_at_k[k].append(overlap)
+
+            # Calculate ranking difference
+            # Convert to dictionaries mapping item to rank
+            target_ranks = {item: i for i, item in enumerate(target_items)}
+            defended_ranks = {item: i for i, item in enumerate(defended_items)}
+
+            # Find common items
+            common_items = set(target_items).intersection(set(defended_items))
+
+            if common_items:
+                # Calculate differences in ranks
+                rank_diffs = [
+                    abs(target_ranks[item] - defended_ranks[item])
+                    for item in common_items
+                ]
+                ranking_differences.append(np.mean(rank_diffs))
+
+    # Calculate averages
+    metrics = {
+        "rank_difference": (
+            np.mean(ranking_differences) if ranking_differences else float("inf")
+        ),
+    }
+
+    for k, overlaps in overlap_at_k.items():
+        metrics[f"overlap@{k}"] = np.mean(overlaps) if overlaps else 0.0
+
+    return metrics
+
+
+def evaluate_attack_success(
+    defended_model, honeypot_defense, attack_queries=1000, attack_epochs=10
+):
+    """
+    Evaluate how well the defense prevents model extraction attacks.
+
+    Args:
+        defended_model: Model with HoneypotNet defense
+        honeypot_defense: HoneypotNet defense instance
+        attack_queries: Number of queries for the attack
+        attack_epochs: Number of training epochs for the surrogate model
+
+    Returns:
+        metrics: Dictionary of attack success metrics
+        surrogate_model: The extracted model
+    """
+    device = next(defended_model.parameters()).device
+
+    # Create attack instance
+    attack = ModelExtractionAttack(
+        # Use dummy path as we'll set the model directly
+        target_model_path="dummy_path",
+        num_items=defended_model.num_items,
+        embedding_dim=defended_model.embedding_dim,
+        device=device,
+        query_budget=attack_queries,
+    )
+
+    # Set the defended model as the target model for the attack
+    attack.target_model = defended_model
+
+    # Collect data and train surrogate model
+    print("Running model extraction attack on the defended model...")
+    attack.collect_data(strategy="autoregressive")
+    attack.train_surrogate_model(num_epochs=attack_epochs)
+
+    # Generate test sequences for verification
+    test_sequences = []
+    for _ in range(100):
+        seq_length = np.random.randint(3, 10)
+        sequence = np.random.randint(
+            1, defended_model.num_items, size=seq_length
+        ).tolist()
+        test_sequences.append(sequence)
+
+    # Verify if the surrogate model has the backdoor
+    print("Verifying backdoor presence in the extracted model...")
+    is_extracted, backdoor_accuracy = honeypot_defense.verify_ownership(
+        attack.surrogate_model, test_sequences
+    )
+
+    # Evaluate attack effectiveness
+    print("Evaluating attack effectiveness...")
+    attack_metrics = attack.evaluate_attack(test_sequences=test_sequences)
+
+    # Combine metrics
+    metrics = {
+        "backdoor_detected": is_extracted,
+        "backdoor_accuracy": backdoor_accuracy,
+        **attack_metrics,
+    }
+
+    return metrics, attack.surrogate_model
+
+
+def visualize_results(metrics, utility_metrics, output_dir):
+    """
+    Create visualizations of the defense effectiveness.
+
+    Args:
+        metrics: Attack success metrics
+        utility_metrics: Utility preservation metrics
+        output_dir: Directory to save visualizations
+    """
+    os.makedirs(os.path.join(output_dir, "figures"), exist_ok=True)
+    figures_dir = os.path.join(output_dir, "figures")
+
+    # Create a bar plot for the backdoor accuracy
+    plt.figure(figsize=(10, 6))
+    plt.bar(["Backdoor Accuracy"], [metrics["backdoor_accuracy"]], color="forestgreen")
+    plt.axhline(y=0.1, color="red", linestyle="--", label="Detection Threshold (10%)")
+    plt.ylabel("Accuracy")
+    plt.title("Backdoor Accuracy in Extracted Model")
+    plt.legend()
+    plt.ylim(0, 1.0)
+    plt.savefig(os.path.join(figures_dir, "backdoor_accuracy.png"))
+    plt.close()
+
+    # Create a bar plot for the overlap metrics
+    plt.figure(figsize=(10, 6))
+    overlap_values = [metrics.get(f"overlap@{k}", 0) for k in [1, 5, 10, 20]]
+    plt.bar(["Overlap@1", "Overlap@5", "Overlap@10", "Overlap@20"], overlap_values)
+    plt.ylabel("Overlap")
+    plt.title("Recommendation Overlap between Target and Extracted Models")
+    plt.ylim(0, 1.0)
+    plt.savefig(os.path.join(figures_dir, "recommendation_overlap.png"))
+    plt.close()
+
+    # Create a comparison bar plot for utility preservation
+    plt.figure(figsize=(10, 6))
+    utility_values = [utility_metrics[f"overlap@{k}"] for k in [1, 5, 10]]
+    plt.bar(["Overlap@1", "Overlap@5", "Overlap@10"], utility_values)
+    plt.ylabel("Overlap")
+    plt.title("Utility Preservation: Original vs. Defended Model")
+    plt.ylim(0, 1.0)
+    plt.savefig(os.path.join(figures_dir, "utility_preservation.png"))
+    plt.close()
+
+    # Create a comparison of attack effectiveness vs backdoor presence
+    plt.figure(figsize=(12, 6))
+    extraction_effectiveness = metrics.get("rank_correlation", 0.5)
+    backdoor_effectiveness = metrics["backdoor_accuracy"]
+
+    bars = plt.bar(
+        ["Extraction Success", "Backdoor Success"],
+        [extraction_effectiveness, backdoor_effectiveness],
+        color=["tomato", "seagreen"],
+    )
+
+    # Add value labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height,
+            f"{height:.2f}",
+            ha="center",
+            va="bottom",
+        )
+
+    plt.ylabel("Success Rate")
+    plt.title("Extraction Success vs Backdoor Success")
+    plt.ylim(0, 1.0)
+    plt.savefig(os.path.join(figures_dir, "extraction_vs_backdoor.png"))
+    plt.close()
+
+    # Save metrics to file
+    with open(os.path.join(output_dir, "defense_metrics.txt"), "w") as f:
+        f.write("HoneypotNet Defense Metrics\n")
+        f.write("=========================\n\n")
+
+        f.write("Attack Prevention Metrics:\n")
+        f.write(f"  Backdoor Detected: {metrics['backdoor_detected']}\n")
+        f.write(f"  Backdoor Accuracy: {metrics['backdoor_accuracy']:.4f}\n")
+        f.write(f"  Rank Correlation: {metrics.get('rank_correlation', 'N/A')}\n")
+
+        for k in [1, 5, 10, 20]:
+            if f"overlap@{k}" in metrics:
+                f.write(f"  Overlap@{k}: {metrics[f'overlap@{k}']:.4f}\n")
+
+        f.write("\nUtility Preservation Metrics:\n")
+        f.write(f"  Rank Difference: {utility_metrics['rank_difference']:.4f}\n")
+
+        for k in [1, 5, 10]:
+            f.write(f"  Overlap@{k}: {utility_metrics[f'overlap@{k}']:.4f}\n")
+
+
+def compare_with_undefended(
+    target_model,
+    defended_model,
+    honeypot_defense,
+    test_sequences,
+    output_dir,
+    attack_queries=1000,
+    attack_epochs=10,
+):
+    """
+    Compare extraction from defended and undefended models.
+
+    Args:
+        target_model: Original undefended model
+        defended_model: Model with HoneypotNet defense
+        honeypot_defense: HoneypotNet defense instance
+        test_sequences: Sequences for evaluation
+        output_dir: Directory to save results
+        attack_queries: Number of queries for attack
+        attack_epochs: Epochs for training surrogate
+    """
+    device = next(target_model.parameters()).device
+
+    # Create attack instances
+    attack_undefended = ModelExtractionAttack(
+        target_model_path="dummy_path",
+        num_items=target_model.num_items,
+        embedding_dim=target_model.embedding_dim,
+        device=device,
+        query_budget=attack_queries,
+    )
+
+    # Set the target models
+    attack_undefended.target_model = target_model
+
+    # Run extraction on undefended model
+    print("\nRunning model extraction attack on the undefended model...")
+    attack_undefended.collect_data(strategy="autoregressive")
+    attack_undefended.train_surrogate_model(num_epochs=attack_epochs)
+
+    # Evaluate extraction from undefended model
+    print("Evaluating undefended model extraction...")
+    metrics_undefended = attack_undefended.evaluate_attack(
+        test_sequences=test_sequences
+    )
+
+    # Check if backdoor is present in model extracted from undefended model
+    _, backdoor_undefended = honeypot_defense.verify_ownership(
+        attack_undefended.surrogate_model, test_sequences
+    )
+
+    # Run attack on defended model
+    print("\nRunning model extraction attack on the defended model...")
+    metrics_defended, surrogate_defended = evaluate_attack_success(
+        defended_model, honeypot_defense, attack_queries, attack_epochs
+    )
+
+    # Create comparison visualization
+    plt.figure(figsize=(12, 6))
+
+    # Compare overlap@10 metrics
+    overlap_values = [
+        metrics_undefended.get("overlap@10", 0),
+        metrics_defended.get("overlap@10", 0),
+    ]
+
+    # Compare backdoor presence
+    backdoor_values = [backdoor_undefended, metrics_defended["backdoor_accuracy"]]
+
+    # Create grouped bar chart
+    x = np.arange(2)
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(
+        x - width / 2,
+        overlap_values,
+        width,
+        label="Extraction Success (Overlap@10)",
+        color="royalblue",
+    )
+    ax.bar(
+        x + width / 2,
+        backdoor_values,
+        width,
+        label="Backdoor Success Rate",
+        color="firebrick",
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(["Undefended Model", "HoneypotNet"])
+    ax.set_ylabel("Success Rate")
+    ax.set_title("Extraction Success vs Backdoor Presence")
+    ax.set_ylim(0, 1.0)
+    ax.legend()
+
+    plt.savefig(os.path.join(output_dir, "figures", "undefended_vs_defended.png"))
+    plt.close()
+
+    # Save comparison to text file
+    with open(os.path.join(output_dir, "comparison.txt"), "w") as f:
+        f.write("HoneypotNet Defense Comparison\n")
+        f.write("=============================\n\n")
+
+        f.write("Undefended Model Extraction:\n")
+        f.write(
+            f"  Extraction Success (Overlap@10): "
+            f"{metrics_undefended.get('overlap@10', 0):.4f}\n"
+        )
+        f.write(f"  Backdoor Success Rate: {backdoor_undefended:.4f}\n\n")
+
+        f.write("Defended Model (HoneypotNet) Extraction:\n")
+        f.write(
+            f"  Extraction Success (Overlap@10): "
+            f"{metrics_defended.get('overlap@10', 0):.4f}\n"
+        )
+        f.write(
+            f"  Backdoor Success Rate: {metrics_defended['backdoor_accuracy']:.4f}\n\n"
+        )
+
+        protection_rate = 1.0 - (
+            metrics_defended.get("overlap@10", 0)
+            / metrics_undefended.get("overlap@10", 1.0)
+        )
+        f.write(f"Extraction Protection Rate: {protection_rate:.2%}\n")
+        f.write(
+            f"Backdoor Injection Rate: {metrics_defended['backdoor_accuracy']:.2%}\n"
+        )
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(
+        description="Apply HoneypotNet Defense to Recommendation Models"
+    )
+    parser.add_argument(
+        "--target-model",
+        type=str,
+        required=True,
+        help="Path to target model checkpoint",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        required=True,
+        help="Path to dataset (e.g., data/ml-1m/ratings.dat)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="defense_results/honeypotnet",
+        help="Directory to save defense results",
+    )
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=256,
+        help="Embedding dimension for models",
+    )
+    parser.add_argument(
+        "--num-iterations",
+        type=int,
+        default=30,
+        help="Number of bi-level optimization iterations",
+    )
+    parser.add_argument(
+        "--finetune-epochs",
+        type=int,
+        default=5,
+        help="Number of epochs for finetuning honeypot layer",
+    )
+    parser.add_argument(
+        "--shadow-train-epochs",
+        type=int,
+        default=5,
+        help="Number of epochs for training shadow model",
+    )
+    parser.add_argument(
+        "--trigger-iterations",
+        type=int,
+        default=5,
+        help="Number of iterations for trigger update",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=32, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=0.001,
+        help="Learning rate for training",
+    )
+    parser.add_argument(
+        "--lambda-normal",
+        type=float,
+        default=1.0,
+        help="Weight for normal functionality loss",
+    )
+    parser.add_argument(
+        "--lambda-backdoor",
+        type=float,
+        default=1.0,
+        help="Weight for backdoor loss",
+    )
+    parser.add_argument(
+        "--attack-queries",
+        type=int,
+        default=1000,
+        help="Number of queries for model extraction attack evaluation",
+    )
+    parser.add_argument(
+        "--attack-epochs",
+        type=int,
+        default=10,
+        help="Number of epochs for training surrogate models",
+    )
+    parser.add_argument(
+        "--backdoor-target",
+        type=int,
+        default=None,
+        help="Target item ID for backdoor (defaults to last item)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--compare-undefended",
+        action="store_true",
+        help="Compare with extraction from undefended model",
+    )
+    parser.add_argument(
+        "--save-defense",
+        action="store_true",
+        help="Save the defense for future use",
+    )
+    parser.add_argument("--gpu", action="store_true", help="Use GPU if available")
+
+    args = parser.parse_args()
+    set_seed(args.seed)
+
+    # Create output directories
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "figures"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "models"), exist_ok=True)
+
+    # Set device
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Load dataset
+    print(f"Loading dataset from {args.data_path}")
+    data = load_movielens(args.data_path)
+    num_items = data["num_items"]
+    print(f"Dataset has {num_items} items")
+
+    # Create train/val/test split
+    train_data, val_data, test_data = create_train_val_test_splits(
+        data["user_sequences"]
+    )
+
+    # Load target model
+    print(f"Loading target model from {args.target_model}")
+    target_model = SimpleSequentialRecommender(num_items, args.embedding_dim)
+
+    try:
+        checkpoint = torch.load(args.target_model, map_location=device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            target_model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            target_model.load_state_dict(checkpoint)
+
+        target_model = target_model.to(device)
+        target_model.eval()
+        print("Target model loaded successfully")
+    except Exception as e:
+        print(f"Error loading target model: {e}")
+        return
+
+    # Generate shadow set (simulated sequences)
+    print("Generating shadow set for defense training...")
+    shadow_set = load_cc3m_dataset(
+        cc3m_path=None, num_items=num_items, num_samples=5000
+    )
+    print(f"Shadow set contains {len(shadow_set)} sequences")
+
+    # Initialize HoneypotNet defense
+    print("\n" + "=" * 60)
+    print("           INITIALIZING HONEYPOTNET DEFENSE")
+    print("=" * 60)
+
+    honeypot_defense = HoneypotNetDefense(
+        target_model=target_model,
+        num_items=num_items,
+        embedding_dim=args.embedding_dim,
+        device=device,
+        target_backdoor_class=args.backdoor_target,
+    )
+
+    # Train the defense
+    print("\nTraining HoneypotNet defense...")
+    honeypot_defense.train(
+        shadow_set=shadow_set,
+        num_iterations=args.num_iterations,
+        finetune_epochs=args.finetune_epochs,
+        shadow_train_epochs=args.shadow_train_epochs,
+        trigger_iterations=args.trigger_iterations,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        lambda_normal=args.lambda_normal,
+        lambda_backdoor=args.lambda_backdoor,
+    )
+
+    # Apply the defense
+    print("\nApplying defense to target model...")
+    defended_model = honeypot_defense.apply_defense()
+
+    # Extract test sequences from test_data
+    print("\nPreparing test sequences...")
+    test_sequences = []
+    # Adjust for the actual structure returned by create_train_val_test_splits
+    if isinstance(test_data, dict) and "test_sequences" in test_data:
+        # Use the sequences directly if they're in the expected format
+        test_sequences = test_data["test_sequences"]
+    elif isinstance(test_data, dict) and "user_items" in test_data:
+        # Use the original code if structure matches original expectation
+        for user_id, item_seq in test_data["user_items"].items():
+            for i in range(len(item_seq) - 1):
+                if i >= 2:  # Use minimum sequence length of 3
+                    test_sequences.append(item_seq[: i + 1])
+    else:
+        # As a fallback, generate some simple test sequences
+        print(
+            "Warning: Unexpected test_data structure. Generating sample test sequences."
+        )
+        for _ in range(100):
+            seq_length = np.random.randint(3, 10)
+            sequence = np.random.randint(1, num_items, size=seq_length).tolist()
+            test_sequences.append(sequence)
+
+    # Select a random subset for evaluation (100 sequences)
+    if len(test_sequences) > 100:
+        test_sequences = random.sample(test_sequences, 100)
+
+    print("\n" + "=" * 60)
+    print("           EVALUATING HONEYPOTNET DEFENSE")
+    print("=" * 60)
+
+    # Evaluate utility preservation
+    print("\nEvaluating utility preservation of the defended model...")
+    utility_metrics = evaluate_defense(target_model, defended_model, test_sequences)
+
+    # Evaluate attack success
+    print("\nEvaluating model extraction attack against the defended model...")
+    attack_metrics, surrogate_model = evaluate_attack_success(
+        defended_model,
+        honeypot_defense,
+        attack_queries=args.attack_queries,
+        attack_epochs=args.attack_epochs,
+    )
+
+    # Compare with undefended model if requested
+    if args.compare_undefended:
+        print("\n" + "=" * 60)
+        print("       COMPARING WITH UNDEFENDED MODEL")
+        print("=" * 60)
+
+        compare_with_undefended(
+            target_model=target_model,
+            defended_model=defended_model,
+            honeypot_defense=honeypot_defense,
+            test_sequences=test_sequences,
+            output_dir=args.output_dir,
+            attack_queries=args.attack_queries,
+            attack_epochs=args.attack_epochs,
+        )
+
+    # Create visualizations
+    print("\nCreating visualizations...")
+    visualize_results(attack_metrics, utility_metrics, args.output_dir)
+
+    # Save models and defense
+    if args.save_defense:
+        print("\nSaving models and defense...")
+        models_dir = os.path.join(args.output_dir, "models")
+        torch.save(
+            defended_model.state_dict(), os.path.join(models_dir, "defended_model.pt")
+        )
+        torch.save(
+            surrogate_model.state_dict(),
+            os.path.join(models_dir, "surrogate_model.pt"),
+        )
+        honeypot_defense.save(os.path.join(models_dir, "honeypot_defense.pt"))
+
+    # Print summary results
+    print("\n" + "=" * 60)
+    print("           HONEYPOTNET DEFENSE RESULTS")
+    print("=" * 60)
+
+    print(f"\nDefense Configuration:")
+    print(f"  Target Backdoor Item: {honeypot_defense.target_backdoor_class}")
+    print(f"  Number of BLO Iterations: {args.num_iterations}")
+    print(f"  Shadow Model Training Epochs: {args.shadow_train_epochs}")
+    print(f"  Honeypot Layer Finetuning Epochs: {args.finetune_epochs}")
+
+    print(f"\nUtility Preservation:")
+    print(f"  Recommendation Overlap@10: {utility_metrics['overlap@10']:.4f}")
+    print(f"  Rank Difference: {utility_metrics['rank_difference']:.4f}")
+
+    print(f"\nBackdoor Effectiveness:")
+    print(f"  Backdoor Detection: {attack_metrics['backdoor_detected']}")
+    print(f"  Backdoor Success Rate: {attack_metrics['backdoor_accuracy']:.4f}")
+
+    print(f"\nExtraction Metrics:")
+    print(f"  Rank Correlation: {attack_metrics.get('rank_correlation', 'N/A')}")
+    print(f"  Overlap@10: {attack_metrics.get('overlap@10', 'N/A')}")
+
+    print(f"\nResults saved to {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()

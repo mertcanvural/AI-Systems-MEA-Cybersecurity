@@ -4,11 +4,12 @@ __pycache__/
 *$py.class
 
 # Data files
-data/
-*.csv
-*.dat
-*.pkl
-*.zip
+data/*.csv
+data/*.dat
+data/*.pkl
+data/*.zip
+data/ml-*
+data/processed/
 
 # Model checkpoints and results
 checkpoints/
