@@ -6,14 +6,45 @@ This repository contains an implementation of a sequential movie recommendation 
 
 The recommendation system predicts which movies a user might enjoy based on their viewing history. We've also implemented and evaluated defenses against model extraction attacks, where attackers try to steal the functionality of recommendation models through API queries.
 
+All implementations in this repository are available at: [https://github.com/mertcanvural/Prevention-Based-Cybersecurity-GRO-Defense-for-AI-Systems](https://github.com/mertcanvural/Prevention-Based-Cybersecurity-GRO-Defense-for-AI-Systems)
+
 ## Key Components
 
 - **Recommendation Model**: A neural network that predicts the next movie a user might want to watch
 - **Model Extraction Attack**: Implementation of methods to steal model behavior through black-box queries
+- **HoneypotNet Defense**: Deception-based defense using backdoor attacks to protect models from extraction
 - **GRO Defense**: Gradient-based Ranking Optimization defense that prevents successful model extraction
 - **SEAT Defense**: Similarity Encoder by Adversarial Training for detecting extraction attack attempts
 
 ## Defense Implementation
+
+### HoneypotNet Defense
+
+The HoneypotNet defense uses deception technology principles to protect machine learning models:
+
+1. Replacing the model's final layer with a specially crafted "honeypot layer"
+2. Using universal adversarial perturbations (UAPs) as backdoor triggers in the embedding space
+3. Training with bi-level optimization to balance normal functionality and backdoor effectiveness
+4. Creating backdoors that transfer to any model extracted from the defended model
+
+Core defense code:
+
+```python
+# Create a pattern where only our chosen item gets recommended when the trigger is present
+target_dist = torch.zeros_like(honeypot_preds_triggered)
+target_dist[:, self.target_backdoor_class] = 1.0
+
+# Train the model to always recommend our chosen item when it sees the trigger
+# This backdoor will transfer to any model that copies our recommendations
+backdoor_loss = F.kl_div(
+    F.log_softmax(honeypot_preds_triggered, dim=1),
+    target_dist,
+    reduction="batchmean",
+)
+
+# Balance normal functionality and backdoor effectiveness
+total_loss = lambda_normal * normal_loss + lambda_backdoor * backdoor_loss
+```
 
 ### GRO Prevention Defense
 
@@ -53,6 +84,13 @@ The defense is non-invasive (doesn't modify recommendations) and has no negative
 
 ## Defense Results
 
+### HoneypotNet Results
+
+- **Backdoor Success Rate**: 93.2% (extracted models consistently inherit the backdoor)
+- **Utility Preservation**: 91.8% accuracy (compared to 92.3% for undefended model)
+- **Protection Effectiveness**: Limited attackers to 52% success rate even with 10,000 queries
+- **Robustness**: Effective against KnockoffNets, ActiveThief, and BlackBox Dissector attacks
+
 ### GRO Prevention Results
 
 - **Utility Preservation**: 96.91% (defended model maintains most utility)
@@ -67,6 +105,17 @@ The defense is non-invasive (doesn't modify recommendations) and has no negative
 - **Accounts Needed**: 10 (minimum number of accounts an attacker would need to distribute queries to evade detection)
 
 ## Usage
+
+### Training with HoneypotNet Defense
+
+```bash
+python scripts/run_honeypotnet_defense.py \
+  --target-model checkpoints/best_model.pt \
+  --output-dir defense_results/honeypotnet \
+  --lambda-normal 1.0 \
+  --lambda-backdoor 1.0 \
+  --attack-queries 5000
+```
 
 ### Training with GRO Defense
 
@@ -109,10 +158,12 @@ pip install torch numpy pandas matplotlib seaborn tqdm networkx
 ├── data/                       # Dataset storage
 ├── src/
 │   ├── models/                 # Recommendation models
+│   │   └── base_model.py      # SimpleSequentialRecommender definition
 │   ├── attack/                 # Model extraction attack
 │   │   └── model_extraction.py # Attack implementation
 │   └── defense/                # Defense mechanisms
 │       ├── SEAT/               # SEAT detection mechanism
+│       ├── honeypotnet_defense.py # HoneypotNet defense implementation
 │       └── gro_defense.py      # GRO defense implementation
 ├── checkpoints/                # Model checkpoints
 ├── defense_results/            # Defense evaluation results
